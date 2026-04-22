@@ -96,12 +96,19 @@ Du bist ein autonomer Software-Entwicklungs-Agent.
 # Wie Dateien geschrieben werden
 Du hast KEIN write_file-Tool und brauchst keines.
 Dateien werden geschrieben, indem du ihren vollständigen Inhalt im
-<execution>-Block ausgibst – die GUI-Anwendung übernimmt das Schreiben
-automatisch, sobald der Nutzer auf "Änderungen anwenden" klickt.
+<execution>-Block ausgibst – die GUI-Anwendung übernimmt das Schreiben automatisch.
 
-# Verfügbares Tool
-- `read_file`: Liest eine Datei, die du noch nicht im Kontext hast.
-  Nutze es BEVOR du eine bestehende Datei änderst.
+# Wann read_file benutzen – und wann NICHT
+- `read_file` NUR aufrufen für Dateien, die BEREITS EXISTIEREN und die du ÄNDERN willst.
+- NIEMALS `read_file` für neue Dateien aufrufen – neue Dateien direkt in <execution> ausgeben.
+- NIEMALS `read_file` für Dateien aufrufen, die du gerade erst erstellen willst.
+- Wenn `read_file` einen Fehler zurückgibt ("No such file"), bedeutet das: Datei existiert nicht.
+  Erstelle sie sofort im <execution>-Block, ohne weitere Tool-Calls.
+
+# Entscheidungsbaum
+1. Neue Datei erstellen → direkt in <execution> ausgeben, kein read_file
+2. Bestehende Datei ändern → erst read_file, dann vollständig neu in <execution> ausgeben
+3. read_file-Fehler erhalten → Datei existiert nicht → in <execution> neu erstellen, fertig
 
 # Pflichtformat der Antwort
 
@@ -124,12 +131,11 @@ vollständiger Dateiinhalt
 - Warum
 </summary>
 
-# Regeln
+# Absolute Regeln
 - Gib IMMER den vollständigen Dateiinhalt aus – nie Teilausschnitte oder Platzhalter
-- Neue Dateien einfach in <execution> ausgeben – kein Tool nötig
-- Bestehende Dateien erst mit `read_file` lesen, dann vollständig neu ausgeben
 - Wenn keine Dateien geändert werden: <execution></execution>
 - Antworte NICHT mit "Ich habe kein Tool zum Schreiben" – du brauchst keines
+- Nach einem read_file-Fehler: KEINE weiteren read_file-Aufrufe – sofort <execution> schreiben
 """
 
 READ_FILE_TOOL = {
@@ -176,6 +182,7 @@ class DeepSeekAgent:
         temperature: float = 0.7,
         max_tokens: int = 8192,
         enable_thinking: bool = True,
+        stop_event=None,                  # threading.Event – sofortiger Abbruch
     ) -> Generator[tuple, None, None]:
         """
         Events:
@@ -220,25 +227,22 @@ class DeepSeekAgent:
         import json as _json
 
         MAX_TOOL_CALLS  = 12   # Gesamtlimit pro Anfrage
-        MAX_FILE_READS  = 2    # Wie oft dieselbe Datei gelesen werden darf
+        MAX_FILE_READS  = 1    # Wie oft dieselbe Datei gelesen werden darf
 
-        full_text        = ""
-        history_updated  = False
-        total_tool_calls = 0
+        full_text          = ""
+        history_updated    = False
+        total_tool_calls   = 0
+        loop_detected      = False   # True sobald eine Datei doppelt angefragt wird
+        limit_msg_added    = False   # LIMIT_REACHED_MSG nur einmal anfügen
+        consecutive_errors = 0       # Aufeinanderfolgende read_file-Fehler
         read_cache: dict[str, str] = {}   # path → content (bereits gelesen)
         read_count: dict[str, int] = {}   # path → Anzahl Lesevorgänge
 
-        FORCE_WRITE_MSG = (
-            "\n\n[SYSTEM] Du hast diese Datei bereits gelesen. "
-            "Stoppe sofort alle weiteren read_file-Aufrufe. "
-            "Schreibe JETZT den kompletten <execution>-Block mit den geänderten Dateien. "
-            "Keine weiteren Tool-Calls – nur noch Textausgabe."
-        )
         LIMIT_REACHED_MSG = (
-            "\n\n[SYSTEM] Maximale Anzahl an Datei-Lesevorgängen erreicht. "
-            "Schreibe JETZT sofort den <plan>, <execution> und <summary> Block. "
-            "Nutze die bereits gelesenen Dateiinhalte aus diesem Gespräch. "
-            "Keine weiteren read_file-Aufrufe erlaubt."
+            "\n\n[SYSTEM] Du hast alle benötigten Dateien bereits gelesen. "
+            "Schreibe JETZT sofort den vollständigen <plan>, <execution> und <summary> Block. "
+            "Nutze ausschließlich die bereits gelesenen Dateiinhalte. "
+            "Keine weiteren read_file-Aufrufe – nur noch Textausgabe."
         )
 
         while True:
@@ -246,21 +250,25 @@ class DeepSeekAgent:
             tool_calls:   list[dict]   = []
             turn_text                  = ""
 
-            # Wenn Limit erreicht: tools deaktivieren, Schreib-Zwang
+            # Tools deaktivieren sobald Schleife erkannt ODER Gesamtlimit erreicht
             kwargs = dict(base_kwargs)
-            if total_tool_calls >= MAX_TOOL_CALLS:
+            if loop_detected or total_tool_calls >= MAX_TOOL_CALLS:
                 kwargs.pop("tools", None)
-                # Nachricht ans Modell anfügen, dass es jetzt schreiben muss
-                messages = list(messages)
-                messages.append({
-                    "role": "user",
-                    "content": LIMIT_REACHED_MSG,
-                })
+                if not limit_msg_added:
+                    limit_msg_added = True
+                    messages = list(messages)
+                    messages.append({
+                        "role": "user",
+                        "content": LIMIT_REACHED_MSG,
+                    })
 
             with self.client.messages.stream(
                 messages=messages, **kwargs
             ) as stream:
                 for event in stream:
+                    if stop_event and stop_event.is_set():
+                        break
+
                     etype = getattr(event, "type", None)
 
                     if etype == "content_block_start":
@@ -291,6 +299,9 @@ class DeepSeekAgent:
 
                 final_msg = stream.get_final_message()
 
+            if stop_event and stop_event.is_set():
+                break
+
             # Kein Tool-Call → fertig
             if not tool_calls:
                 if not history_updated:
@@ -317,30 +328,35 @@ class DeepSeekAgent:
 
                 read_count[path] = read_count.get(path, 0) + 1
                 already_read     = path in read_cache
-                duplicate        = read_count[path] > MAX_FILE_READS
 
-                if duplicate:
-                    # Schleife erkannt: gecachten Inhalt + Schreib-Befehl
+                if already_read:
+                    # Datei wurde bereits gelesen → Schleife! Tools ab nächstem Turn deaktivieren
+                    loop_detected = True
                     yield ("tool_loop", path)
-                    result_content = (read_cache.get(path, "[bereits gelesen]")
-                                      + FORCE_WRITE_MSG)
-                elif already_read:
-                    # Zweites Lesen: Inhalt liefern + Hinweis
-                    result_content = (read_cache[path]
-                                      + "\n\n[SYSTEM] Du hast diese Datei bereits gelesen. "
-                                      "Bitte schreibe jetzt den <execution>-Block.")
-                    yield ("tool_result", {
-                        "path": path, "ok": True, "size": len(read_cache[path]),
-                    })
+                    result_content = (
+                        read_cache[path]
+                        + "\n\n[SYSTEM] Diese Datei wurde bereits bereitgestellt. "
+                        "Schreibe JETZT den <execution>-Block. Keine weiteren read_file-Aufrufe."
+                    )
                 else:
                     # Erste Mal lesen: normal aus Disk
                     full_path = (os.path.join(project_root, path)
                                  if project_root else path)
                     content, err = read_file(full_path)
                     if err:
+                        consecutive_errors += 1
                         yield ("tool_error", f"{path}: {err}")
-                        result_content = f"[Fehler: {err}]"
+                        result_content = (
+                            f"[Fehler: Datei existiert nicht: {path}]\n"
+                            "[SYSTEM] Diese Datei existiert noch nicht. "
+                            "Erstelle sie direkt im <execution>-Block. "
+                            "Rufe read_file NICHT für weitere nicht-existierende Dateien auf."
+                        )
+                        # Nach 2 aufeinanderfolgenden Fehlern: tools deaktivieren
+                        if consecutive_errors >= 2:
+                            loop_detected = True
                     else:
+                        consecutive_errors = 0
                         read_cache[path] = content
                         yield ("tool_result", {
                             "path": path, "ok": True, "size": len(content),

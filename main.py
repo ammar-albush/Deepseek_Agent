@@ -1147,19 +1147,27 @@ class App:
                     f"  🌳  project_structure.json  ({scope})  eingeschlossen\n\n")
         self._w("user", f"  Du:  {prompt}\n\n")
 
+        # Alle tkinter-Variablen sicher im Haupt-Thread auslesen
+        settings = {
+            "thinking":   self.v_thinking.get(),
+            "temp":       self.v_temp.get(),
+            "max_tokens": int(self.v_tokens.get()),
+        }
+
         threading.Thread(
             target=self._worker,
-            args=(prompt, ctx, self.v_path.get().strip()),
+            args=(prompt, ctx, self.v_path.get().strip(), settings),
             daemon=True,
         ).start()
 
-    def _worker(self, prompt: str, ctx: dict[str, str], project_root: str):
+    def _worker(self, prompt: str, ctx: dict[str, str], project_root: str,
+                settings: dict):
         import re as _re
         try:
             text_buffer    = ""
             thinking_chars = 0
             thinking_open  = False
-            use_thinking   = self.v_thinking.get()
+            use_thinking   = settings["thinking"]
 
             # ── Live-Parser-Zustand ────────────────────────────────────
             plan_hdr_shown   = False
@@ -1261,9 +1269,10 @@ class App:
                 context_files=ctx,
                 project_root=project_root,
                 history=self._history,
-                temperature=self.v_temp.get(),
-                max_tokens=int(self.v_tokens.get()),
+                temperature=settings["temp"],
+                max_tokens=settings["max_tokens"],
                 enable_thinking=use_thinking,
+                stop_event=self._stop_event,
             ):
                 if event_type == "thinking":
                     thinking_chars += len(data)
